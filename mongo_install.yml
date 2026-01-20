@@ -1,0 +1,27 @@
+---
+- name: Install MongoDB 8 on Ubuntu 22.04
+  hosts: mongo
+  become: yes
+  tasks:
+    - name: Import MongoDB GPG key
+      ansible.builtin.apt_key:
+        url: https://pgp.mongodb.com/server-8.0.asc
+        state: present
+
+    - name: Add MongoDB repository
+      ansible.builtin.apt_repository:
+        repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/8.0 multiverse"
+        state: present
+
+    - name: Install MongoDB
+      ansible.builtin.apt:
+        name: mongodb-org
+        state: present
+        update_cache: yes
+
+    - name: Enable and start MongoDB
+      ansible.builtin.systemd:
+        name: mongod
+        enabled: yes
+        state: started
+

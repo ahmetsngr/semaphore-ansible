@@ -1,0 +1,190 @@
+---
+- name: Install Percona Server for MongoDB (PSMDB) - selectable major (6/7/8)
+  hosts: mongo
+  become: yes
+  gather_facts: yes
+
+  vars:
+    # Semaphore Survey Enum Value: 6 / 7 / 8
+    psmdb_major: "{{ psmdb_major | default('8') }}"
+    percona_release_deb: "percona-release_latest.{{ ansible_lsb.codename }}_all.deb"
+    prevent_autostart_during_install: true
+
+  pre_tasks:
+    - name: Validate selected PSMDB major
+      ansible.builtin.assert:
+        that:
+          - psmdb_major | string in ['6','7','8']
+        fail_msg: "psmdb_major must be one of: 6, 7, 8"
+        success_msg: "Selected PSMDB major is valid: {{ psmdb_major }}"
+
+    # --- NODE SELF-HEAL (dpkg/python/byobu issue) ---
+    - name: Check dpkg audit (broken/half-installed packages)
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Detect if byobu is in a bad dpkg state
+      ansible.builtin.shell: |
+        set -e
+        dpkg -l byobu 2>/dev/null | awk 'NR==6{print $1}' || true
+      args:
+        executable: /bin/bash
+      register: byobu_state
+      changed_when: false
+      failed_when: false
+
+    - name: Purge byobu if dpkg state is not "ii" (fix python3 py3clean hook failure)
+      ansible.builtin.shell: |
+        set -e
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y byobu || true
+      args:
+        executable: /bin/bash
+      when: byobu_state.stdout is defined and byobu_state.stdout != "" and byobu_state.stdout != "ii"
+      changed_when: false
+
+    - name: Fix broken dpkg if any (self-heal)
+      ansible.builtin.shell: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        dpkg --configure -a || true
+        apt-get -f install -y || true
+        dpkg --configure -a || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Ensure base apt & debconf packages (critical)
+      ansible.builtin.apt:
+        name:
+          - debconf
+          - debconf-utils
+          - apt-utils
+        state: present
+        update_cache: yes
+
+    - name: Ensure prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - apt-transport-https
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Prevent services from auto-start during package install (policy-rc.d)
+      ansible.builtin.copy:
+        dest: /usr/sbin/policy-rc.d
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          exit 101
+      when: prevent_autostart_during_install | bool
+
+  tasks:
+    - name: Download percona-release package
+      ansible.builtin.get_url:
+        url: "https://repo.percona.com/apt/{{ percona_release_deb }}"
+        dest: "/tmp/{{ percona_release_deb }}"
+        mode: "0644"
+
+    - name: Install percona-release
+      ansible.builtin.apt:
+        deb: "/tmp/{{ percona_release_deb }}"
+
+    - name: Disable any previously enabled PSMDB repos (avoid candidate confusion)
+      ansible.builtin.shell: |
+        percona-release disable psmdb-60 || true
+        percona-release disable psmdb-70 || true
+      percona-release disable psmdb-80 || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Enable Percona PSMDB repo (selected major)
+      ansible.builtin.command: "percona-release enable psmdb-{{ psmdb_major }}0 release"
+      args:
+        creates: "/etc/apt/sources.list.d/percona-psmdb-{{ psmdb_major }}0-release.list"
+
+    - name: apt update
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Get latest available version for selected major from apt (major-filtered)
+      ansible.builtin.shell: |
+        set -e
+        apt-cache madison percona-server-mongodb \
+          | awk '{print $3}' \
+          | grep -E "^{{ psmdb_major }}\." \
+          | head -n 1
+      args:
+        executable: /bin/bash
+      register: psmdb_candidate
+      changed_when: false
+
+    - name: Fail if no matching candidate found for selected major
+      ansible.builtin.assert:
+        that:
+          - psmdb_candidate.stdout is match("^[0-9]+\\.")
+        fail_msg: "No installable percona-server-mongodb version found for major {{ psmdb_major }}. Check repo / connectivity."
+
+    - name: Install Percona Server for MongoDB (latest minor/patch of selected major)
+      ansible.builtin.apt:
+        name: "percona-server-mongodb={{ psmdb_candidate.stdout }}"
+        state: present
+      register: psmdb_install
+      retries: 3
+      delay: 5
+      until: psmdb_install is succeeded
+
+  post_tasks:
+    - name: Remove policy-rc.d after install
+      ansible.builtin.file:
+        path: /usr/sbin/policy-rc.d
+        state: absent
+      when: prevent_autostart_during_install | bool
+
+    - name: Fix broken dpkg after install if any (self-heal)
+      ansible.builtin.shell: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        dpkg --configure -a || true
+        apt-get -f install -y || true
+        dpkg --configure -a || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # 1) mongod.conf ownership + permission
+    - name: Set ownership & permissions of /etc/mongod.conf to mongod
+      ansible.builtin.file:
+        path: /etc/mongod.conf
+        owner: mongod
+        group: mongod
+        mode: "0640"
+
+    # 2) MongoDB servisini enable + start et
+    - name: Enable and start mongod service
+      ansible.builtin.systemd:
+        name: mongod
+        enabled: yes
+        state: started
+
+    - name: Print installed versions
+      ansible.builtin.shell: |
+        echo "--- mongod --version ---"
+        mongod --version | sed -n '1,8p'
+        echo "--- apt list | grep percona-server-mongodb ---"
+        apt list --installed 2>/dev/null | grep percona-server-mongodb || true
+      args:
+        executable: /bin/bash
+      register: ver_out
+      changed_when: false
+
+    - name: Show versions
+      ansible.builtin.debug:
+        msg: "{{ ver_out.stdout_lines }}"
+

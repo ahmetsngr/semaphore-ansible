@@ -1,0 +1,180 @@
+---
+- name: Configure PSMDB 8.0 replica set
+  hosts: mongo
+  become: yes
+  gather_facts: yes
+
+
+  tasks:
+    - name: check mongod data path
+      ansible.builtin.stat:
+        path: "{{mongodb_datapath}}"
+      register: mongodbdatapathstat
+
+    - name: check mongod data path
+      ansible.builtin.file:
+        path: "{{mongodb_datapath}}"
+        state: directory
+        owner: mongod
+        group: mongod
+        mode: '0755'
+        recursive: true
+      when: not mongodbdatapathstat.stat.exists    
+
+    - name: Ensure mongod is enabled and running
+      systemd:
+        name: mongod
+        enabled: yes
+        state: restarted
+      when: not mongodbdatapathstat.stat.exists    
+
+    - name: Ensure mongod is enabled and running
+      systemd:
+        name: mongod
+        enabled: yes
+        state: started
+    
+        # - name: Wait for mongod TCP port ready
+        #   wait_for:
+        #     host: 127.0.0.1
+        #     port: 27017
+        #     delay: 3
+        #     timeout: 60
+    
+    - name: check mongod log path
+      ansible.builtin.stat:
+        path: "{{mongodb_logpath}}"
+      register: mongodblogpathstat
+
+    - name: Configure logrotate for MongoDB
+      ansible.builtin.template:
+        src: mongodlogrotate.conf.j2
+        dest: /etc/logrotate.d/mongodb
+        owner: root
+        group: root
+        mode: '0644'
+    
+    - name: check mongod key path
+      ansible.builtin.stat:
+        path: "{{mongodb_keypath}}"
+      register: mongodbkeypathstat
+        
+    - name: check mongod key path
+      ansible.builtin.command: openssl rand -base64 756
+      register: rand_base64
+      run_once: true
+      when: not mongodbkeypathstat.stat.exists
+
+    - name: check mongod key path
+      ansible.builtin.copy:
+        dest: "{{mongodb_keypath}}"
+        content: "{{ rand_base64.stdout }}"
+        owner: mongod
+        group: mongod
+        mode: '0600'
+      when: not mongodbkeypathstat.stat.exists
+   
+    - name: Check auth. enable
+      shell: |
+        mongosh --quiet --username {{ mongousername | default('dba') or 'dba' }} --password {{mongouserpassword}} --eval "db.runCommand({ ping: 1 })" 
+      args:
+        executable: /bin/bash
+      register: mongoauthstatus
+      failed_when: false
+      changed_when: false  
+
+
+    - name: enable auth.
+      ansible.builtin.shell: |
+        /usr/bin/percona-server-mongodb-enable-auth.sh -q -u {{mongousername | default('dba') or 'dba' }} -p {{mongouserpassword}}
+      args: 
+        executable: /usr/bin/bash
+      failed_when: false
+      changed_when: false
+      when: mongoauthstatus.rc != 0
+
+    
+    - name: Copy mongod.conf
+      ansible.builtin.template:
+        src: mongod.conf.j2
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart mongod
+
+    - debug:
+        var: mongoauthstatus
+
+    - name: Wait for mongod TCP port ready
+      wait_for:
+        host: "0.0.0.0"
+        port: 27017
+        delay: 3
+        timeout: 60
+
+    - name: Restart mongod before replica set operations
+      systemd:
+        name: mongod
+        state: restarted
+      become: yes
+
+    - name: Build replica set members list from mongo group
+      ansible.builtin.set_fact:
+        rs_members: >-
+          [{% for host in groups['mongo'] %}
+          {"_id": {{ loop.index0 }}, "host": "{{ hostvars[host]['ansible_host'] | default(host) }}:27017"}{% if not loop.last %},{% endif %}
+          {% endfor %}]
+      run_once: true
+
+    - name: Check if replica set already initiated
+      ansible.builtin.shell: |
+        mongosh --quiet \
+          -u {{ mongousername }} \
+          -p '{{ mongouserpassword }}' \
+          --authenticationDatabase admin \
+          --eval 'const cfg = db.getSiblingDB("local").system.replset.findOne(); if (cfg) { print("RS_ALREADY_INIT"); quit(0); } else { print("RS_NOT_INIT"); quit(1); }'
+      args:
+        executable: /bin/bash
+      register: rs_status
+      failed_when: false
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['mongo'][0] }}"
+
+    - name: Show replica set check result
+      debug:
+        var: rs_status
+      run_once: true
+      delegate_to: "{{ groups['mongo'][0] }}"
+
+    - name: Initiate replica set (only once, on first mongo node)
+      ansible.builtin.shell: |
+        mongosh --quiet \
+          -u {{ mongousername }} \
+          -p '{{ mongouserpassword }}' \
+          --authenticationDatabase admin \
+          --eval 'rs.initiate({ _id: "{{ replset_name }}", members: {{ rs_members | to_json }} })'
+      args:
+        executable: /bin/bash
+      register: rs_initiate
+      # rs_status.rc = 1  -> RS_NOT_INIT -> initiate et
+      when: rs_status.rc != 0
+      run_once: true
+      delegate_to: "{{ groups['mongo'][0] }}"
+
+    - name: Show rs.initiate result
+      debug:
+        var: rs_initiate
+      when: rs_initiate is defined
+      run_once: true
+      delegate_to: "{{ groups['mongo'][0] }}"
+
+
+  handlers:
+    - name: restart mongod
+      systemd:
+        name: mongod
+        state: restarted
+
+

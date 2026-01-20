@@ -1,0 +1,125 @@
+---
+- name: Purge all MongoDB variants (Community / Percona / PBM) on Ubuntu 22.04+
+  hosts: mongo
+  become: yes
+  gather_facts: yes
+
+  vars:
+    wipe_data: true   # DİKKAT: true ise veri/log/config klasörleri silinir!
+    pkg_patterns:
+      - "mongodb-org*"
+      - "mongodb-mongosh*"
+      - "mongodb-database-tools*"
+      - "mongodb-compass*"
+      - "percona-server-mongodb*"
+      - "psmdb*"
+      - "pbm*"
+    repo_files:
+      - "/etc/apt/sources.list.d/mongodb*.list"
+      - "/etc/apt/sources.list.d/*mongo*.list"
+      - "/etc/apt/sources.list.d/percona*psmdb*.list"
+      - "/etc/apt/sources.list.d/percona*.list"
+    key_globs:
+      - "/etc/apt/trusted.gpg.d/*mongo*.gpg"
+      - "/etc/apt/trusted.gpg.d/*percona*.gpg"
+      - "/usr/share/keyrings/*mongo*.gpg"
+      - "/usr/share/keyrings/*percona*.gpg"
+    data_dirs:
+      - "/var/lib/mongo"
+      - "/var/log/mongodb"
+      - "/etc/mongod.conf"
+      - "/etc/mongodb.conf"
+      - "/etc/percona-server-mongodb"
+      - "/var/run/mongodb"
+
+  pre_tasks:
+    - name: OS doğrulama
+      assert:
+        that:
+          - ansible_os_family == "Debian"
+        fail_msg: "Bu playbook Debian/Ubuntu içindir."
+
+  tasks:
+    - name: Servisleri durdur (mongod, mongos)
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - mongod
+        - mongos
+      ignore_errors: true
+
+    - name: Paketleri purge et (MongoDB/Percona/PBM) - pattern bazlı
+      apt:
+        name: "{{ item }}"
+        state: absent
+        purge: true
+      loop: "{{ pkg_patterns }}"
+      register: purge_each
+      failed_when: false
+      ignore_errors: true
+
+    - name: percona-release paketini de kaldır (varsa)
+      apt:
+        name: percona-release
+        state: absent
+        purge: true
+      failed_when: false
+      ignore_errors: true
+
+    - name: APT repo dosyalarını sil
+      shell: |
+        shopt -s nullglob
+        for f in {{ repo_files | join(' ') }}; do rm -f "$f"; done
+      args:
+        executable: /bin/bash
+
+    - name: Mongo/Percona GPG anahtarlarını sil
+      shell: |
+        shopt -s nullglob
+        for k in {{ key_globs | join(' ') }}; do rm -f "$k"; done
+      args:
+        executable: /bin/bash
+
+    - name: apt cache güncelle
+      apt:
+        update_cache: yes
+
+    - name: Veri ve log dizinlerini sil (DİKKAT)
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ data_dirs }}"
+      when: wipe_data | bool
+
+    - name: Eski mongod servis dosyasını temizle (varsa)
+      file:
+        path: /etc/systemd/system/mongod.service
+        state: absent
+      ignore_errors: true
+
+    - name: systemd daemon-reload
+      systemd:
+        daemon_reload: true
+
+    - name: Kalan mongod binary'sini sil (varsa)
+      file:
+        path: /usr/bin/mongod
+        state: absent
+      ignore_errors: true
+
+    - name: Doğrulama (bilgi amaçlı)
+      shell: |
+        echo "== which mongod =="; command -v mongod || echo "yok"
+        echo "== dpkg -l | egrep 'mongo|percona|psmdb|pbm' =="; dpkg -l | egrep 'mongo|percona|psmdb|pbm' || echo "ilgili paket yok"
+        echo "== systemctl is-active mongod =="; systemctl is-active mongod || echo "servis yok"
+      args:
+        executable: /bin/bash
+      register: verify_out
+      changed_when: false
+
+    - debug:
+        msg: "{{ verify_out.stdout_lines }}"
+
+

@@ -1,0 +1,69 @@
+---
+- name: Install Percona Server for MongoDB 8.0 (Ubuntu 22.04)
+  hosts: mongo
+  become: yes
+  gather_facts: yes
+
+  vars:
+    percona_release_deb: "percona-release_latest.{{ ansible_lsb.codename }}_all.deb"
+
+  pre_tasks:
+    - name: Ensure prerequisites
+      apt:
+        name:
+          - ca-certificates
+          - apt-transport-https
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+  tasks:
+    - name: Download percona-release package
+      get_url:
+        url: "https://repo.percona.com/apt/{{ percona_release_deb }}"
+        dest: "/tmp/{{ percona_release_deb }}"
+        mode: "0644"
+
+    - name: Install percona-release
+      apt:
+        deb: "/tmp/{{ percona_release_deb }}"
+
+    - name: Enable Percona PSMDB 8.0 repo (release channel)
+      command: percona-release enable psmdb-80 release
+      args:
+        creates: /etc/apt/sources.list.d/percona-psmdb-80-release.list
+
+    - name: apt update
+      apt:
+        update_cache: yes
+
+    - name: Install Percona Server for MongoDB (latest)
+      apt:
+        name: percona-server-mongodb
+        state: present
+
+    # Not: PSMDB 8.0 ile THP varsayılan olarak desteklenir.
+    # İstersen THP'yi açık ettiğinden emin olmak için OS bazlı adımlar ekleyebilirsin.
+
+    - name: Enable & start mongod
+      systemd:
+        name: mongod
+        enabled: yes
+        state: started
+
+  post_tasks:
+    - name: Print installed versions
+      shell: |
+        echo "--- mongod --version ---"
+        mongod --version | sed -n '1,8p'
+        echo "--- apt list | grep percona-server-mongodb ---"
+        apt list --installed 2>/dev/null | grep percona-server-mongodb || true
+      register: ver_out
+      changed_when: false
+
+    - name: Show versions
+      debug:
+        msg: "{{ ver_out.stdout_lines }}"
+
